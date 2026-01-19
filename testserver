@@ -427,3 +427,15 @@ cmd_build_functional_clone() {
   echo "You can now run the VM:"
   echo "    ./testserver run"
 }
+case "${1:-}" in
+  init-disk) cmd_init_disk ;;
+  attach-gui) cmd_attach_gui ;;
+  attach-cli) cmd_attach_cli ;;
+  detach) cmd_detach ;;
+  run) cmd_run ;;
+  snapshot) shift; cmd_snapshot "$@" ;;
+  restore) shift; cmd_restore "$@" ;;
+  exec-offline) shift; cmd_exec_offline "$@" ;;
+  build-functional-clone) cmd_build_functional_clone ;;
+  *) usage ;;
+esac
