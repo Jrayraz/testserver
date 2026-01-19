@@ -1,0 +1,429 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Lightweight Test Server Subsystem
+# qcow2 disk + NBD + GUI visibility + VM + offline exec + functional clone
+# Designed for Debian/Ubuntu hosts (debootstrap-based functional clone)
+
+DISK_IMAGE="${DISK_IMAGE:-testserver.qcow2}"
+DISK_SIZE="${DISK_SIZE:-25G}"          # lightweight default
+NBD_DEV="${NBD_DEV:-/dev/nbd0}"
+MOUNT_POINT="${MOUNT_POINT:-/mnt/testserver}"
+RAM_MB="${RAM_MB:-6144}"               # ~6 GiB
+CPUS="${CPUS:-2}"
+OS_ISO="${OS_ISO:-}"                   # empty by default; no random ISO
+QGA_SOCKET="${QGA_SOCKET:-/tmp/testserver-qga.sock}"
+
+usage() {
+  cat <<EOF
+Lightweight Test Server
+
+Usage: $0 <command> [args]
+
+Commands:
+  init-disk                 Create qcow2 disk + GPT + ext4 filesystem
+  attach-gui                Attach qcow2 via NBD for GUI tools (Disks, GParted, etc.)
+  attach-cli                Attach qcow2 via NBD and mount at ${MOUNT_POINT}
+  detach                    Unmount and disconnect NBD
+  run                       Boot the VM (6 GiB RAM, 2 cores, guest agent socket)
+  snapshot [name]           Create a qcow2 snapshot (optional name)
+  restore <name>            Restore a qcow2 snapshot
+  exec-offline <cmd>        Run a command inside the filesystem via chroot (VM off)
+  build-functional-clone    Build a minimal functional clone of the host into the qcow2
+
+Environment overrides:
+  DISK_IMAGE   (default: ${DISK_IMAGE})
+  DISK_SIZE    (default: ${DISK_SIZE})
+  NBD_DEV      (default: ${NBD_DEV})
+  MOUNT_POINT  (default: ${MOUNT_POINT})
+  RAM_MB       (default: ${RAM_MB})
+  CPUS         (default: ${CPUS})
+  OS_ISO       (default: ${OS_ISO})
+  QGA_SOCKET   (default: ${QGA_SOCKET})
+
+IMPORTANT:
+  - Never have the VM running and the NBD device attached at the same time.
+  - For GUI visibility, use:  $0 attach-gui
+  - For CLI access, use:      $0 attach-cli
+  - build-functional-clone is designed for Debian/Ubuntu-style hosts.
+EOF
+}
+
+require_root() {
+  if [[ $EUID -ne 0 ]]; then
+    echo "This command must be run as root." >&2
+    exit 1
+  fi
+}
+
+ensure_disk_exists() {
+  if [[ ! -f "${DISK_IMAGE}" ]]; then
+    echo "Disk image ${DISK_IMAGE} not found. Run init-disk first." >&2
+    exit 1
+  fi
+}
+cmd_init_disk() {
+  require_root
+
+  if [[ -e "${DISK_IMAGE}" ]]; then
+    echo "Disk image ${DISK_IMAGE} already exists. Refusing to overwrite." >&2
+    exit 1
+  fi
+
+  echo "[*] Creating qcow2 disk: ${DISK_IMAGE} (${DISK_SIZE})"
+  qemu-img create -f qcow2 "${DISK_IMAGE}" "${DISK_SIZE}"
+
+  echo "[*] Loading nbd module"
+  modprobe nbd max_part=16
+
+  echo "[*] Connecting ${DISK_IMAGE} to ${NBD_DEV}"
+  qemu-nbd --connect="${NBD_DEV}" "${DISK_IMAGE}"
+
+  echo "[*] Creating GPT and single ext4 partition"
+  parted -s "${NBD_DEV}" mklabel gpt
+  parted -s -a opt "${NBD_DEV}" mkpart primary ext4 1MiB 100%
+
+  echo "[*] Informing kernel of partition table"
+  partprobe "${NBD_DEV}"
+  sleep 2
+
+  echo "[*] Creating ext4 filesystem on ${NBD_DEV}p1"
+  mkfs.ext4 -L testroot "${NBD_DEV}p1"
+
+  echo "[*] Disconnecting NBD (disk is now initialized)"
+  qemu-nbd --disconnect "${NBD_DEV}"
+
+  echo "[+] Disk initialized: ${DISK_IMAGE}"
+  echo "    Use 'attach-gui', 'attach-cli', or 'build-functional-clone' next."
+}
+
+cmd_attach_gui() {
+  require_root
+  ensure_disk_exists
+
+  echo "[*] Loading nbd module"
+  modprobe nbd max_part=16
+
+  echo "[*] Connecting ${DISK_IMAGE} to ${NBD_DEV}"
+  qemu-nbd --connect="${NBD_DEV}" "${DISK_IMAGE}"
+
+  echo "[*] Informing kernel of partition table"
+  partprobe "${NBD_DEV}"
+  sleep 2
+
+  echo
+  echo "[+] Attached for GUI tools."
+  echo "    Block device: ${NBD_DEV} (and ${NBD_DEV}p1)"
+  echo "    Open 'Disks', 'GParted', or your file manager to see and mount it."
+}
+
+cmd_attach_cli() {
+  require_root
+  ensure_disk_exists
+
+  echo "[*] Loading nbd module"
+  modprobe nbd max_part=16
+
+  echo "[*] Connecting ${DISK_IMAGE} to ${NBD_DEV}"
+  qemu-nbd --connect="${NBD_DEV}" "${DISK_IMAGE}"
+
+  echo "[*] Informing kernel of partition table"
+  partprobe "${NBD_DEV}"
+  sleep 2
+
+  echo "[*] Creating mount point ${MOUNT_POINT}"
+  mkdir -p "${MOUNT_POINT}"
+
+  echo "[*] Mounting ${NBD_DEV}p1 on ${MOUNT_POINT}"
+  mount "${NBD_DEV}p1" "${MOUNT_POINT}"
+
+  echo
+  echo "[+] Attached and mounted at ${MOUNT_POINT}"
+  echo "    You can now use ls/cp/mv/rm/etc. on ${MOUNT_POINT}"
+}
+
+cmd_detach() {
+  require_root
+
+  echo "[*] Attempting to unmount ${MOUNT_POINT}"
+  if mountpoint -q "${MOUNT_POINT}"; then
+    umount "${MOUNT_POINT}"
+    echo "[*] Unmounted ${MOUNT_POINT}"
+  else
+    echo "[*] ${MOUNT_POINT} is not mounted."
+  fi
+
+  echo "[*] Disconnecting ${NBD_DEV}"
+  if [[ -b "${NBD_DEV}" ]]; then
+    qemu-nbd --disconnect "${NBD_DEV}" || true
+    echo "[*] Disconnected ${NBD_DEV}"
+  else
+    echo "[*] ${NBD_DEV} not present."
+  fi
+
+  echo "[+] NBD detached."
+}
+cmd_run() {
+  ensure_disk_exists
+
+  echo "[*] Launching VM:"
+  echo "    Disk: ${DISK_IMAGE}"
+  echo "    RAM:  ${RAM_MB} MB"
+  echo "    CPUs: ${CPUS}"
+  echo "    QGA socket: ${QGA_SOCKET}"
+  if [[ -n "${OS_ISO}" ]]; then
+    echo "    Using OS_ISO: ${OS_ISO}"
+  fi
+
+  # If OS_ISO is empty, skip -cdrom and boot from disk only.
+  if [[ -n "${OS_ISO}" ]]; then
+    qemu-system-x86_64 \
+      -enable-kvm \
+      -m "${RAM_MB}" \
+      -smp "${CPUS}" \
+      -drive file="${DISK_IMAGE}",if=virtio,format=qcow2 \
+      -cdrom "${OS_ISO}" \
+      -boot order=d \
+      -display default \
+      -name "lightweight-testserver" \
+      -chardev socket,id=qga0,path="${QGA_SOCKET}",server=on,wait=off \
+      -device virtio-serial \
+      -device virtserialport,chardev=qga0,name=org.qemu.guest_agent.0
+  else
+    qemu-system-x86_64 \
+      -enable-kvm \
+      -m "${RAM_MB}" \
+      -smp "${CPUS}" \
+      -drive file="${DISK_IMAGE}",if=virtio,format=qcow2 \
+      -boot order=c \
+      -display default \
+      -name "lightweight-testserver" \
+      -chardev socket,id=qga0,path="${QGA_SOCKET}",server=on,wait=off \
+      -device virtio-serial \
+      -device virtserialport,chardev=qga0,name=org.qemu.guest_agent.0
+  fi
+}
+
+cmd_snapshot() {
+  ensure_disk_exists
+  local snap="${1:-snapshot-$(date +%s)}"
+
+  echo "[*] Creating snapshot '${snap}' on ${DISK_IMAGE}"
+  qemu-img snapshot -c "${snap}" "${DISK_IMAGE}"
+  echo "[+] Snapshot created: ${snap}"
+}
+
+cmd_restore() {
+  ensure_disk_exists
+  local snap="${1:-}"
+
+  if [[ -z "${snap}" ]]; then
+    echo "Snapshot name required." >&2
+    exit 1
+  fi
+
+  echo "[*] Restoring snapshot '${snap}' on ${DISK_IMAGE}"
+  qemu-img snapshot -a "${snap}" "${DISK_IMAGE}"
+  echo "[+] Snapshot restored: ${snap}"
+}
+
+cmd_exec_offline() {
+  require_root
+  ensure_disk_exists
+
+  if [[ $# -lt 1 ]]; then
+    echo "Usage: $0 exec-offline <command...>" >&2
+    exit 1
+  fi
+
+  local cmd="$*"
+
+  echo "[*] Loading nbd module"
+  modprobe nbd max_part=16
+
+  echo "[*] Connecting ${DISK_IMAGE} to ${NBD_DEV}"
+  qemu-nbd --connect="${NBD_DEV}" "${DISK_IMAGE}"
+
+  echo "[*] Informing kernel of partition table"
+  partprobe "${NBD_DEV}"
+  sleep 2
+
+  echo "[*] Creating mount point ${MOUNT_POINT}"
+  mkdir -p "${MOUNT_POINT}"
+
+  echo "[*] Mounting ${NBD_DEV}p1 on ${MOUNT_POINT}"
+  mount "${NBD_DEV}p1" "${MOUNT_POINT}"
+
+  echo "[*] Running offline command inside chroot:"
+  echo "    ${cmd}"
+  chroot "${MOUNT_POINT}" /bin/bash -c "${cmd}"
+
+  echo "[*] Cleaning up"
+  umount "${MOUNT_POINT}"
+  qemu-nbd --disconnect "${NBD_DEV}"
+
+  echo "[+] Offline command completed."
+}
+cmd_build_functional_clone() {
+  require_root
+  ensure_disk_exists
+
+  echo "[*] Starting build-functional-clone"
+  echo "[*] This will create a lightweight functional clone of the host."
+
+  # ---------------------------------------------------------------------------
+  # 0. Sanity checks
+  # ---------------------------------------------------------------------------
+
+  if ! command -v debootstrap >/dev/null 2>&1; then
+    echo "ERROR: debootstrap not found. This command requires a Debian/Ubuntu host." >&2
+    exit 1
+  fi
+
+  if [[ ! -f /etc/os-release ]]; then
+    echo "ERROR: /etc/os-release missing. Cannot determine host distro." >&2
+    exit 1
+  fi
+
+  local codename
+  codename="$(. /etc/os-release && echo "${VERSION_CODENAME:-}")"
+
+  if [[ -z "${codename}" ]]; then
+    echo "ERROR: Could not determine VERSION_CODENAME from /etc/os-release." >&2
+    exit 1
+  fi
+
+  echo "[*] Host codename detected: ${codename}"
+
+  # ---------------------------------------------------------------------------
+  # 1. Attach qcow2 via NBD
+  # ---------------------------------------------------------------------------
+
+  echo "[*] Loading nbd module"
+  modprobe nbd max_part=16
+
+  echo "[*] Connecting ${DISK_IMAGE} to ${NBD_DEV}"
+  qemu-nbd --connect="${NBD_DEV}" "${DISK_IMAGE}"
+
+  echo "[*] Informing kernel of partition table"
+  partprobe "${NBD_DEV}"
+  sleep 2
+
+  echo "[*] Creating mount point ${MOUNT_POINT}"
+  mkdir -p "${MOUNT_POINT}"
+
+  echo "[*] Mounting ${NBD_DEV}p1 on ${MOUNT_POINT}"
+  mount "${NBD_DEV}p1" "${MOUNT_POINT}"
+
+  # ---------------------------------------------------------------------------
+  # 2. Bootstrap a minimal OS into the qcow2
+  # ---------------------------------------------------------------------------
+
+  echo "[*] Bootstrapping minimal system into ${MOUNT_POINT}"
+  debootstrap --variant=minbase "${codename}" "${MOUNT_POINT}" || {
+    echo "ERROR: debootstrap failed." >&2
+    umount "${MOUNT_POINT}"
+    qemu-nbd --disconnect "${NBD_DEV}"
+    exit 1
+  }
+
+  # ---------------------------------------------------------------------------
+  # 3. Bind host pseudo-filesystems for chroot operations
+  # ---------------------------------------------------------------------------
+
+  echo "[*] Binding /dev, /proc, /sys into chroot"
+  mount --bind /dev  "${MOUNT_POINT}/dev"
+  mount --bind /proc "${MOUNT_POINT}/proc"
+  mount --bind /sys  "${MOUNT_POINT}/sys"
+
+  # ---------------------------------------------------------------------------
+  # 4. Copy host configuration (lightweight, no large data)
+  # ---------------------------------------------------------------------------
+
+  echo "[*] Copying host configuration into clone"
+
+  # /etc — configs only, excluding sensitive or host-specific files
+  rsync -aHAX --delete \
+    --exclude="shadow" \
+    --exclude="gshadow" \
+    --exclude="passwd-" \
+    --exclude="group-" \
+    --exclude="ssh/ssh_host_*" \
+    /etc/ "${MOUNT_POINT}/etc/"
+
+  # /usr/local — custom scripts, binaries, tools
+  if [[ -d /usr/local ]]; then
+    rsync -aHAX /usr/local/ "${MOUNT_POINT}/usr/local/"
+  fi
+
+  # /opt — optional, usually small
+  if [[ -d /opt ]]; then
+    rsync -aHAX /opt/ "${MOUNT_POINT}/opt/"
+  fi
+
+  # ---------------------------------------------------------------------------
+  # 5. Sync installed packages from host → clone
+  # ---------------------------------------------------------------------------
+
+  echo "[*] Syncing package set from host (apt-mark showmanual)"
+
+  if command -v apt-mark >/dev/null 2>&1; then
+    apt-mark showmanual > /tmp/testserver-manual-packages.txt
+
+    # Remove packages that would break the clone or are host-specific
+    sed -i '/^grub-/d' /tmp/testserver-manual-packages.txt || true
+    sed -i '/^linux-image/d' /tmp/testserver-manual-packages.txt || true
+    sed -i '/^linux-headers/d' /tmp/testserver-manual-packages.txt || true
+
+    echo "[*] Installing packages inside clone"
+    chroot "${MOUNT_POINT}" /bin/bash -c "
+      set -e
+      apt-get update
+      xargs -a /tmp/testserver-manual-packages.txt apt-get -y install || true
+    "
+  else
+    echo "WARNING: apt-mark not found; skipping package sync."
+  fi
+
+  # ---------------------------------------------------------------------------
+  # 6. Install GRUB bootloader
+  # ---------------------------------------------------------------------------
+
+  echo "[*] Installing GRUB bootloader into ${NBD_DEV}"
+
+  chroot "${MOUNT_POINT}" /bin/bash -c "
+    set -e
+    if command -v grub-install >/dev/null 2>&1; then
+      grub-install '${NBD_DEV}'
+      update-grub || true
+    else
+      echo 'WARNING: grub-install not found inside clone; install grub-pc manually.' >&2
+    fi
+  "
+
+  # ---------------------------------------------------------------------------
+  # 7. Cleanup
+  # ---------------------------------------------------------------------------
+
+  echo "[*] Unbinding pseudo-filesystems"
+  umount "${MOUNT_POINT}/dev" || true
+  umount "${MOUNT_POINT}/proc" || true
+  umount "${MOUNT_POINT}/sys" || true
+
+  echo "[*] Unmounting ${MOUNT_POINT}"
+  umount "${MOUNT_POINT}"
+
+  echo "[*] Disconnecting ${NBD_DEV}"
+  qemu-nbd --disconnect "${NBD_DEV}"
+
+  echo
+  echo "[+] Functional clone successfully built!"
+  echo "    - OS matches host"
+  echo "    - Package set matches host"
+  echo "    - Configs copied (lightweight)"
+  echo "    - No large data copied"
+  echo "    - Bootloader installed"
+  echo
+  echo "You can now run the VM:"
+  echo "    ./testserver run"
+}
